@@ -1,6 +1,4 @@
-# onehook-noslop
-
-**One Hook, No Slop.**
+# One Hook, No Slop.
 
 Are you tired of seeing this pattern plastered all over social media, marketing copy, and even your own files?
 
