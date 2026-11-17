@@ -1,7 +1,14 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { test } from "node:test"
-import { extractEdits, scanText } from "./couplets.mjs"
+import { fileURLToPath } from "node:url"
+import { allowEntries, extractEdits, scanText } from "./couplets.mjs"
+
+const SCRIPT = fileURLToPath(new URL("./couplets.mjs", import.meta.url))
+const ISOLATED_HOME = mkdtempSync(join(tmpdir(), "noslop-hook-home-"))
 
 const blocked = [
   "Four moments, one job",
@@ -27,10 +34,12 @@ const passed = [
 for (const s of blocked) test(`flags: ${s}`, () => assert.ok(scanText(s).length > 0))
 for (const s of passed) test(`passes: ${s}`, () => assert.equal(scanText(s).length, 0))
 
-function runHook(input) {
-  return spawnSync(process.execPath, ["couplets.mjs", "--hook"], {
+function runHook(input, { cwd, home, env } = {}) {
+  return spawnSync(process.execPath, [SCRIPT, "--hook"], {
+    cwd,
     input: typeof input === "string" ? input : JSON.stringify(input),
     encoding: "utf8",
+    env: { ...process.env, HOME: home ?? ISOLATED_HOME, NOSLOP_ALLOW: "", ...env },
   })
 }
 
@@ -122,4 +131,68 @@ test("shell and read tools pass", () => {
 
 test("malformed input never blocks", () => {
   assert.equal(runHook("not json").status, 0)
+})
+
+test("allow file comments and blank lines are ignored", () => {
+  assert.deepEqual(allowEntries("# docs/style.md\n\n  imports/ \nnotes.md\n"), ["imports/", "notes.md"])
+})
+
+test("a project allow list skips that file and still blocks others", () => {
+  const dir = mkdtempSync(join(tmpdir(), "noslop-proj-allow-"))
+  const home = mkdtempSync(join(tmpdir(), "noslop-proj-allow-home-"))
+  mkdirSync(join(dir, ".onehook-noslop"), { recursive: true })
+  writeFileSync(join(dir, ".onehook-noslop", "allow"), "# keep\nstyle-guide.md\n")
+  const allowed = runHook(
+    { tool_name: "Write", tool_input: { file_path: join(dir, "docs", "style-guide.md"), content: BAD } },
+    { cwd: dir, home },
+  )
+  assert.equal(allowed.status, 0)
+  const blocked = runHook(
+    { tool_name: "Write", tool_input: { file_path: join(dir, "docs", "page.md"), content: BAD } },
+    { cwd: dir, home },
+  )
+  assert.equal(blocked.status, 2)
+})
+
+test("a global allow list applies in a repo that has no local list", () => {
+  const dir = mkdtempSync(join(tmpdir(), "noslop-glob-allow-"))
+  const home = mkdtempSync(join(tmpdir(), "noslop-glob-allow-home-"))
+  mkdirSync(join(home, ".onehook-noslop"), { recursive: true })
+  writeFileSync(join(home, ".onehook-noslop", "allow"), "glossary.md\n")
+  const allowed = runHook(
+    { tool_name: "Write", tool_input: { file_path: join(dir, "glossary.md"), content: BAD } },
+    { cwd: dir, home },
+  )
+  assert.equal(allowed.status, 0)
+  const blocked = runHook(
+    { tool_name: "Write", tool_input: { file_path: join(dir, "page.md"), content: BAD } },
+    { cwd: dir, home },
+  )
+  assert.equal(blocked.status, 2)
+})
+
+test("NOSLOP_ALLOW still skips a matching path", () => {
+  const dir = mkdtempSync(join(tmpdir(), "noslop-env-allow-"))
+  const r = runHook(
+    { tool_name: "Write", tool_input: { file_path: join(dir, "notes.md"), content: BAD } },
+    { cwd: dir, env: { NOSLOP_ALLOW: "notes.md" } },
+  )
+  assert.equal(r.status, 0)
+})
+
+test("scan skips a path listed in the project allow file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "noslop-scan-"))
+  const home = mkdtempSync(join(tmpdir(), "noslop-scan-home-"))
+  mkdirSync(join(dir, ".onehook-noslop"), { recursive: true })
+  writeFileSync(join(dir, ".onehook-noslop", "allow"), "quoted.md\n")
+  writeFileSync(join(dir, "quoted.md"), "One app, many teams\n")
+  writeFileSync(join(dir, "other.md"), "One app, many teams\n")
+  const r = spawnSync(process.execPath, [SCRIPT, dir], {
+    cwd: dir,
+    encoding: "utf8",
+    env: { ...process.env, HOME: home, NOSLOP_ALLOW: "" },
+  })
+  assert.equal(r.status, 1)
+  assert.match(r.stdout, /other\.md/)
+  assert.doesNotMatch(r.stdout, /quoted\.md/)
 })

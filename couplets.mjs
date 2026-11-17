@@ -15,11 +15,17 @@
 // A literal list joined with "and" instead of a comma passes ("two bistros and
 // three wine bars"). That is the intended escape hatch for genuine counts.
 //
-// NOSLOP_ALLOW: comma-separated path fragments the hook and scanner skip, for
-// example style guides that quote the construct as a banned example.
+// Skipped paths, merged, in addition to node_modules/, .next/, dist/ and .git/:
+//   ~/.onehook-noslop/allow                         global, every repo
+//   <repo>/.onehook-noslop/allow                    local, travels with the repo
+//   an allow file sitting next to this script       per-install list
+//   NOSLOP_ALLOW                                     comma-separated fragments
+// One fragment per line. A file is skipped when its path contains the fragment.
+// Lines that are empty or start with # are ignored.
 
-import { readdirSync, readFileSync, statSync } from "node:fs"
-import { basename, extname, join, relative } from "node:path"
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
+import { homedir } from "node:os"
+import { basename, dirname, extname, join, relative, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 // Exact quantities. At least one side of a couplet must be one of these.
@@ -43,17 +49,74 @@ const SENTENCE_MIRROR = new RegExp(
 )
 
 const SELF = basename(fileURLToPath(import.meta.url))
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
+const BUILTIN_ALLOW = ["node_modules/", ".next/", "dist/", ".git/"]
 
-const ALLOWED = [
-  "node_modules/",
-  ".next/",
-  "dist/",
-  ".git/",
-  ...(process.env.NOSLOP_ALLOW ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean),
-]
+export function globalAllowPath() {
+  return join(homedir(), ".onehook-noslop", "allow")
+}
+
+// One fragment per line. Blank lines and lines starting with # are comments.
+export function allowEntries(text) {
+  const out = []
+  for (const line of String(text).split("\n")) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith("#")) continue
+    out.push(trimmed)
+  }
+  return out
+}
+
+// Nearest <dir>/.onehook-noslop/allow above start, stopping before the home
+// directory so the global file is not also treated as a project file.
+export function findProjectAllow(start) {
+  if (!start) return null
+  let dir
+  try {
+    dir = statSync(start).isDirectory() ? resolve(start) : dirname(resolve(start))
+  } catch {
+    dir = dirname(resolve(start))
+  }
+  const home = resolve(homedir())
+  while (resolve(dir) !== home) {
+    const candidate = join(dir, ".onehook-noslop", "allow")
+    if (existsSync(candidate)) return candidate
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return null
+}
+
+function readEntries(path) {
+  try {
+    return allowEntries(readFileSync(path, "utf8"))
+  } catch {
+    return []
+  }
+}
+
+// Built-ins, the global file, the nearest project file, a list beside this
+// script, and NOSLOP_ALLOW. starts are extra directories or file paths to
+// search upward from (edited files, scan targets).
+export function allowPatterns(starts = []) {
+  const files = []
+  const add = (path) => {
+    if (!path || !existsSync(path)) return
+    const abs = resolve(path)
+    if (!files.includes(abs)) files.push(abs)
+  }
+  add(globalAllowPath())
+  add(join(SCRIPT_DIR, "allow"))
+  for (const start of [process.cwd(), SCRIPT_DIR, ...starts]) add(findProjectAllow(start))
+  const patterns = [...BUILTIN_ALLOW]
+  for (const file of files) patterns.push(...readEntries(file))
+  for (const piece of (process.env.NOSLOP_ALLOW ?? "").split(",")) {
+    const trimmed = piece.trim()
+    if (trimmed) patterns.push(trimmed)
+  }
+  return patterns
+}
 
 const PROSE_EXT = new Set([
   ".md",
@@ -94,26 +157,26 @@ export function scanText(text) {
   return hits
 }
 
-export function isAllowed(path) {
+function pathAllowed(path, patterns) {
   const p = path.replaceAll("\\", "/")
-  return basename(p) === SELF || ALLOWED.some((a) => p.includes(a))
+  return basename(p) === SELF || patterns.some((a) => p.includes(a))
 }
 
-function isProsePath(path) {
+function isProsePath(path, patterns) {
   if (!path) return true // unknown target: scan it
-  if (isAllowed(path)) return false
+  if (pathAllowed(path, patterns)) return false
   const ext = extname(path)
   return !ext || PROSE_EXT.has(ext)
 }
 
-function walk(path, out) {
+function walk(path, out, patterns) {
   const st = statSync(path)
   if (st.isDirectory()) {
     for (const name of readdirSync(path)) {
       if (name === "node_modules" || name.startsWith(".")) continue
-      walk(join(path, name), out)
+      walk(join(path, name), out, patterns)
     }
-  } else if (PROSE_EXT.has(extname(path)) && !isAllowed(path)) {
+  } else if (PROSE_EXT.has(extname(path)) && !pathAllowed(path, patterns)) {
     out.push(path)
   }
 }
@@ -240,7 +303,8 @@ async function hookMode() {
   } catch {
     process.exit(0) // never break a turn on input we do not understand
   }
-  const hits = edits.filter((e) => isProsePath(e.path)).flatMap((e) => scanText(e.text))
+  const patterns = allowPatterns(edits.map((e) => e.path).filter(Boolean))
+  const hits = edits.filter((e) => isProsePath(e.path, patterns)).flatMap((e) => scanText(e.text))
   if (!hits.length) process.exit(0)
   respond(detectAgent(event), hits)
 }
@@ -250,8 +314,9 @@ function cliMode(targets) {
     console.error("usage: node couplets.mjs <file-or-dir> [...more]   |   --hook")
     process.exit(1)
   }
+  const patterns = allowPatterns(targets)
   const files = []
-  for (const t of targets) walk(t, files)
+  for (const t of targets) walk(t, files, patterns)
   let total = 0
   for (const f of files) {
     const hits = scanText(readFileSync(f, "utf8"))

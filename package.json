@@ -1,6 +1,6 @@
 {
   "name": "onehook-noslop",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "Pre-edit hook for Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI that blocks mirrored quantity phrases such as \"One app, many teams\".",
   "type": "module",
   "bin": {
@@ -9,7 +9,8 @@
   "exports": "./couplets.mjs",
   "files": [
     "cli.mjs",
-    "couplets.mjs"
+    "couplets.mjs",
+    "plugin"
   ],
   "scripts": {
     "test": "node --test test.mjs install.test.mjs"

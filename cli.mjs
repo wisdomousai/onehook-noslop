@@ -13,14 +13,26 @@
 // edit runs a local file and needs no network access.
 
 import { spawnSync } from "node:child_process"
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SCRIPT = join(HERE, "couplets.mjs")
+const PLUGIN_SRC = join(HERE, "plugin")
+const SKILL = join(PLUGIN_SRC, "SKILL.md")
 const MARKER = "onehook-noslop"
+const VERSION = JSON.parse(readFileSync(join(HERE, "package.json"), "utf8")).version
+
+// Comments only, so a fresh install skips nothing until the user adds a line.
+const ALLOW_TEMPLATE = `# Paths onehook-noslop skips. One path fragment per line.
+# A file is skipped when its path contains the fragment.
+# Blank lines and lines starting with # are ignored.
+#
+# docs/style-guide.md
+# imports/
+`
 
 const home = (envVar, name) => process.env[envVar] || join(homedir(), name)
 
@@ -156,7 +168,7 @@ function planInstall(t) {
   return cfg
 }
 
-function selectAgents(args, project) {
+function selectAgents(args, project, allowEmpty = false) {
   const i = args.indexOf("--agent")
   const raw = i >= 0 ? args[i + 1] : undefined
   if (raw) {
@@ -165,17 +177,159 @@ function selectAgents(args, project) {
     if (bad.length) throw new Error(`Unknown agent: ${bad.join(", ")}. Use ${Object.keys(AGENTS).join(", ")} or all.`)
     return ids
   }
-  const found = Object.keys(AGENTS).filter((id) => existsSync(AGENTS[id].userDir()))
-  if (!found.length) {
+  const found = Object.keys(AGENTS).filter((id) => agentInUse(id))
+  if (!found.length && !allowEmpty) {
     throw new Error(`No agent config folder found. Name the agents with --agent ${Object.keys(AGENTS).join(",")}.`)
   }
   return found
 }
 
+// The plugin lives in ~/.claude/skills. That directory alone is not a Claude
+// Code install, so a machine that only has the plugin does not also get the
+// settings.json hook.
+function agentInUse(id) {
+  const dir = AGENTS[id].userDir()
+  if (!existsSync(dir)) return false
+  if (id !== "claude") return true
+  for (const name of readdirSync(dir)) {
+    if (name !== "skills") return true
+    for (const skill of readdirSync(join(dir, "skills"))) {
+      if (skill !== MARKER) return true
+    }
+  }
+  return false
+}
+
+function allowFile(project) {
+  return project ? join(process.cwd(), ".onehook-noslop", "allow") : join(homedir(), ".onehook-noslop", "allow")
+}
+
+// Create the allow list for this install scope when it is missing.
+// A second install leaves an existing list untouched. Uninstall does not remove it.
+function ensureAllow(project, dryRun) {
+  const path = allowFile(project)
+  if (existsSync(path)) {
+    console.log(`\nAllow list: ${path}`)
+    return
+  }
+  if (dryRun) {
+    console.log(`\nAllow list: would create ${path}`)
+    return
+  }
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, ALLOW_TEMPLATE)
+  console.log(`\nAllow list: created ${path}`)
+}
+
+// Claude Code loads a plugin from ~/.claude/skills/<name>/ when that folder
+// contains .claude-plugin/plugin.json. Claude Desktop admits that same
+// skills-directory plugin, so its hook runs in Code and, on recent Desktop
+// versions, in Cowork and Chat. The Office add-ins do not run the hook. They
+// read a skill turned on in Claude settings, which is the zip written beside
+// the allow list.
+function pluginDirs(project) {
+  if (project) return [join(process.cwd(), ".claude", "skills", MARKER)]
+  const dirs = [join(homedir(), ".claude", "skills", MARKER)]
+  if (process.env.CLAUDE_CONFIG_DIR) dirs.push(join(process.env.CLAUDE_CONFIG_DIR, "skills", MARKER))
+  return [...new Set(dirs.map((d) => resolve(d)))]
+}
+
+function skillZip(project) {
+  const root = project ? process.cwd() : homedir()
+  return join(root, ".onehook-noslop", `${MARKER}.zip`)
+}
+
+function crc32(buf) {
+  let c = ~0
+  for (const b of buf) {
+    c ^= b
+    for (let i = 0; i < 8; i++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1))
+  }
+  return ~c >>> 0
+}
+
+// Stored (uncompressed) zip. The archive root is the skill folder, which is
+// the shape Claude Desktop asks for when you upload a skill.
+function zipStore(files) {
+  const parts = []
+  const central = []
+  let offset = 0
+  for (const f of files) {
+    const name = Buffer.from(f.name)
+    const data = Buffer.from(f.data)
+    const crc = crc32(data)
+    const local = Buffer.alloc(30)
+    local.writeUInt32LE(0x04034b50, 0)
+    local.writeUInt16LE(20, 4) // version needed
+    local.writeUInt16LE(0, 8) // store, no compression
+    local.writeUInt32LE(crc, 14)
+    local.writeUInt32LE(data.length, 18)
+    local.writeUInt32LE(data.length, 22)
+    local.writeUInt16LE(name.length, 26)
+    const cen = Buffer.alloc(46)
+    cen.writeUInt32LE(0x02014b50, 0)
+    cen.writeUInt16LE(20, 4)
+    cen.writeUInt16LE(20, 6)
+    cen.writeUInt32LE(crc, 16)
+    cen.writeUInt32LE(data.length, 20)
+    cen.writeUInt32LE(data.length, 24)
+    cen.writeUInt16LE(name.length, 28)
+    cen.writeUInt32LE(offset, 42)
+    parts.push(local, name, data)
+    central.push(cen, name)
+    offset += local.length + name.length + data.length
+  }
+  const centralBuf = Buffer.concat(central)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(files.length, 8)
+  end.writeUInt16LE(files.length, 10)
+  end.writeUInt32LE(centralBuf.length, 12)
+  end.writeUInt32LE(offset, 16)
+  return Buffer.concat([...parts, centralBuf, end])
+}
+
+function installClaudePlugin(project, dryRun) {
+  const dirs = pluginDirs(project)
+  const zip = skillZip(project)
+  if (dryRun) {
+    for (const dir of dirs) console.log(`\nClaude plugin: would write ${dir}`)
+    console.log(`Skill archive: would write ${zip}`)
+    return
+  }
+  const manifest = JSON.parse(readFileSync(join(PLUGIN_SRC, ".claude-plugin", "plugin.json"), "utf8"))
+  manifest.version = VERSION
+  for (const dir of dirs) {
+    mkdirSync(join(dir, ".claude-plugin"), { recursive: true })
+    mkdirSync(join(dir, "hooks"), { recursive: true })
+    writeFileSync(join(dir, ".claude-plugin", "plugin.json"), `${JSON.stringify(manifest, null, 2)}\n`)
+    copyFileSync(join(PLUGIN_SRC, "hooks", "hooks.json"), join(dir, "hooks", "hooks.json"))
+    copyFileSync(SKILL, join(dir, "SKILL.md"))
+    copyFileSync(SCRIPT, join(dir, "couplets.mjs"))
+    writeFileSync(join(dir, "version.json"), `${JSON.stringify({ version: VERSION })}\n`)
+    console.log(`\nClaude plugin: ${dir}`)
+  }
+  mkdirSync(dirname(zip), { recursive: true })
+  const skill = readFileSync(SKILL)
+  writeFileSync(zip, zipStore([{ name: `${MARKER}/SKILL.md`, data: skill }]))
+  console.log(`Skill archive: ${zip}`)
+  console.log("  Claude Code and Claude Desktop load the plugin from the skills folder.")
+  console.log("  Upload the archive in Claude Desktop: Customize, Skills, Create skill, Upload a skill.")
+  console.log("  The Word, Excel, PowerPoint, and Outlook add-ins then use that skill. They do not run the file hook.")
+}
+
+function removeClaudePlugin(project) {
+  for (const dir of pluginDirs(project)) {
+    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+  }
+  rmSync(skillZip(project), { force: true })
+  console.log("Claude plugin: removed.")
+}
+
 function install(args) {
   const project = args.includes("--project")
   const dryRun = args.includes("--dry-run")
-  const targets = selectAgents(args, project).map((id) => locate(id, project))
+  const targets = selectAgents(args, project, true).map((id) => locate(id, project))
   const plans = targets.map((t) => [t, planInstall(t)]) // parse every config before writing any
   for (const [t, cfg] of plans) {
     if (dryRun) {
@@ -191,11 +345,13 @@ function install(args) {
     console.log(`  Config: ${t.config}`)
     console.log(`  ${t.reload}`)
   }
+  ensureAllow(project, dryRun)
+  installClaudePlugin(project, dryRun)
 }
 
 function uninstall(args) {
   const project = args.includes("--project")
-  for (const t of selectAgents(args, project).map((id) => locate(id, project))) {
+  for (const t of selectAgents(args, project, true).map((id) => locate(id, project))) {
     let removed = false
     if (t.kind === "file") {
       removed = existsSync(t.config)
@@ -208,6 +364,7 @@ function uninstall(args) {
     if (existsSync(t.hookDir)) rmSync(t.hookDir, { recursive: true, force: true })
     console.log(`${t.name}: ${removed ? `removed from ${t.config}` : "no hook found"}.`)
   }
+  removeClaudePlugin(project)
 }
 
 function passthrough(args) {

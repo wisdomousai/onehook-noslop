@@ -1,0 +1,8 @@
+{
+  "name": "onehook-noslop",
+  "description": "Stops mirrored quantity phrases in prose, documents, slides, spreadsheets, email, and chat.",
+  "version": "0.4.0",
+  "author": {
+    "name": "Wisdomous AI"
+  }
+}
