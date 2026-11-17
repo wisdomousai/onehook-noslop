@@ -1,7 +1,7 @@
 {
   "name": "onehook-noslop",
-  "version": "0.1.0",
-  "description": "Claude Code hook that blocks mirrored number phrases such as \"Three signals. One job.\" in prose edits.",
+  "version": "0.2.0",
+  "description": "Pre-edit hook for Claude Code, Codex, Cursor, Gemini CLI and Copilot CLI that blocks mirrored quantity phrases such as \"One app, many teams\".",
   "type": "module",
   "bin": {
     "onehook-noslop": "cli.mjs"
@@ -19,6 +19,10 @@
   },
   "keywords": [
     "claude-code",
+    "codex",
+    "cursor",
+    "gemini-cli",
+    "copilot",
     "hook",
     "prose",
     "lint",

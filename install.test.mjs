@@ -8,58 +8,86 @@ import { fileURLToPath } from "node:url"
 
 const CLI = fileURLToPath(new URL("./cli.mjs", import.meta.url))
 
-function run(args, { cwd, env = {} } = {}) {
-  return spawnSync(process.execPath, [CLI, ...args], {
-    cwd,
-    env: { ...process.env, ...env },
-    encoding: "utf8",
-  })
+function run(args, { cwd, home }) {
+  const env = { ...process.env, HOME: home }
+  delete env.CLAUDE_CONFIG_DIR
+  delete env.CODEX_HOME
+  delete env.COPILOT_HOME
+  return spawnSync(process.execPath, [CLI, ...args], { cwd, env, encoding: "utf8" })
 }
 
-function ourHooks(settings) {
-  return (settings.hooks?.PreToolUse ?? []).flatMap((g) => g.hooks).filter((h) => h.command.includes("onehook-noslop"))
-}
+const json = (p) => JSON.parse(readFileSync(p, "utf8"))
+const commands = (cfg, event) =>
+  (cfg.hooks?.[event] ?? []).flatMap((g) => (g.hooks ? g.hooks.map((h) => h.command) : [g.command]))
+const ourCount = (cfg, event) => commands(cfg, event).filter((c) => c.includes("onehook-noslop")).length
 
-test("global install keeps other settings, is idempotent, and uninstalls cleanly", () => {
-  const dir = mkdtempSync(join(tmpdir(), "noslop-"))
-  const env = { CLAUDE_CONFIG_DIR: dir }
-  const other = { matcher: "Bash", hooks: [{ type: "command", command: "echo other" }] }
-  writeFileSync(join(dir, "settings.json"), JSON.stringify({ model: "x", hooks: { PreToolUse: [other] } }))
+test("default install picks agents whose folders exist and keeps other hooks", () => {
+  const home = mkdtempSync(join(tmpdir(), "noslop-home-"))
+  mkdirSync(join(home, ".codex"))
+  mkdirSync(join(home, ".cursor"))
+  const other = { matcher: "^Bash$", hooks: [{ type: "command", command: "python3 guard.py" }] }
+  writeFileSync(join(home, ".codex", "hooks.json"), JSON.stringify({ hooks: { PreToolUse: [other] } }))
 
-  assert.equal(run(["install"], { env }).status, 0)
-  assert.equal(run(["install"], { env }).status, 0)
-  let s = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))
-  assert.equal(s.model, "x")
-  assert.equal(ourHooks(s).length, 1)
-  assert.deepEqual(s.hooks.PreToolUse[0], other)
-  assert.ok(existsSync(join(dir, "hooks", "onehook-noslop", "couplets.mjs")))
+  const r = run(["install"], { cwd: home, home })
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(run(["install"], { cwd: home, home }).status, 0)
 
-  assert.equal(run(["uninstall"], { env }).status, 0)
-  s = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))
-  assert.equal(ourHooks(s).length, 0)
-  assert.deepEqual(s.hooks.PreToolUse, [other])
-  assert.ok(!existsSync(join(dir, "hooks", "onehook-noslop")))
+  const codex = json(join(home, ".codex", "hooks.json"))
+  assert.deepEqual(codex.hooks.PreToolUse[0], other)
+  assert.equal(ourCount(codex, "PreToolUse"), 1)
+  assert.ok(existsSync(join(home, ".codex", "hooks", "onehook-noslop", "couplets.mjs")))
+
+  const cursor = json(join(home, ".cursor", "hooks.json"))
+  assert.equal(cursor.version, 1)
+  assert.equal(ourCount(cursor, "preToolUse"), 1)
+
+  assert.ok(!existsSync(join(home, ".claude")), "claude folder absent, so not installed")
+
+  assert.equal(run(["uninstall"], { cwd: home, home }).status, 0)
+  assert.deepEqual(json(join(home, ".codex", "hooks.json")).hooks.PreToolUse, [other])
+  assert.deepEqual(json(join(home, ".cursor", "hooks.json")), { version: 1 })
+  assert.ok(!existsSync(join(home, ".codex", "hooks", "onehook-noslop")))
 })
 
-test("project install writes .claude/settings.json and the installed hook blocks a couplet", () => {
+test("--agent all --project writes every project config, and the copied hook blocks", () => {
+  const home = mkdtempSync(join(tmpdir(), "noslop-home-"))
   const cwd = mkdtempSync(join(tmpdir(), "noslop-proj-"))
-  assert.equal(run(["install", "--project"], { cwd }).status, 0)
-  const s = JSON.parse(readFileSync(join(cwd, ".claude", "settings.json"), "utf8"))
-  assert.match(ourHooks(s)[0].command, /\$CLAUDE_PROJECT_DIR/)
+  const r = run(["install", "--project", "--agent", "all"], { cwd, home })
+  assert.equal(r.status, 0, r.stderr)
 
-  const script = join(cwd, ".claude", "hooks", "onehook-noslop", "couplets.mjs")
-  const r = spawnSync(process.execPath, [script, "--hook"], {
-    input: JSON.stringify({ tool_name: "Write", tool_input: { file_path: "a.md", content: "Two layers, one rule" } }),
+  assert.equal(ourCount(json(join(cwd, ".claude", "settings.json")), "PreToolUse"), 1)
+  assert.equal(ourCount(json(join(cwd, ".codex", "hooks.json")), "PreToolUse"), 1)
+  assert.equal(ourCount(json(join(cwd, ".cursor", "hooks.json")), "preToolUse"), 1)
+  assert.equal(ourCount(json(join(cwd, ".gemini", "settings.json")), "BeforeTool"), 1)
+  assert.equal(ourCount(json(join(cwd, ".github", "hooks", "onehook-noslop.json")), "preToolUse"), 1)
+
+  const script = join(cwd, ".codex", "hooks", "onehook-noslop", "couplets.mjs")
+  const hook = spawnSync(process.execPath, [script, "--hook"], {
+    input: JSON.stringify({ tool_name: "apply_patch", tool_input: { command: "*** Begin Patch\n*** Add File: a.md\n+One app, many teams\n*** End Patch" } }),
     encoding: "utf8",
   })
-  assert.equal(r.status, 2)
+  assert.equal(hook.status, 2)
+
+  assert.equal(run(["uninstall", "--project", "--agent", "all"], { cwd, home }).status, 0)
+  assert.ok(!existsSync(join(cwd, ".github", "hooks", "onehook-noslop.json")))
+  assert.ok(!existsSync(join(cwd, ".claude", "hooks", "onehook-noslop")))
 })
 
-test("install refuses to overwrite unparseable settings", () => {
-  const dir = mkdtempSync(join(tmpdir(), "noslop-bad-"))
-  mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, "settings.json"), "{ not json")
-  const r = run(["install"], { env: { CLAUDE_CONFIG_DIR: dir } })
+test("a bad config stops the install before any file is written", () => {
+  const home = mkdtempSync(join(tmpdir(), "noslop-home-"))
+  mkdirSync(join(home, ".claude"))
+  mkdirSync(join(home, ".codex"))
+  writeFileSync(join(home, ".codex", "hooks.json"), "{ not json")
+  const r = run(["install"], { cwd: home, home })
   assert.equal(r.status, 1)
-  assert.equal(readFileSync(join(dir, "settings.json"), "utf8"), "{ not json")
+  assert.match(r.stderr, /Cannot parse/)
+  assert.ok(!existsSync(join(home, ".claude", "settings.json")))
+  assert.equal(readFileSync(join(home, ".codex", "hooks.json"), "utf8"), "{ not json")
+})
+
+test("unknown agent is rejected", () => {
+  const home = mkdtempSync(join(tmpdir(), "noslop-home-"))
+  const r = run(["install", "--agent", "vim"], { cwd: home, home })
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /Unknown agent: vim/)
 })

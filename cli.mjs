@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 // onehook-noslop command line.
 //
-//   onehook-noslop install [--project] [--dry-run]   add the hook to Claude Code settings
-//   onehook-noslop uninstall [--project]             remove the hook from Claude Code settings
-//   onehook-noslop scan <file-or-dir> [...more]      list couplets in existing files
-//   onehook-noslop hook                              run as a PreToolUse hook (stdin JSON)
+//   onehook-noslop install   [--project] [--agent <list>] [--dry-run]
+//   onehook-noslop uninstall [--project] [--agent <list>]
+//   onehook-noslop scan <file-or-dir> [...more]
+//   onehook-noslop hook
 //
-// Global install writes to $CLAUDE_CONFIG_DIR or ~/.claude. Project install
-// writes to .claude/ in the current directory. In both cases the hook script is
-// copied next to the settings file, so each edit runs a local file and needs no
-// network access.
+// <list> is a comma-separated list of: claude, codex, cursor, gemini, copilot, all.
+// Without --agent, the command uses every agent whose user config folder exists.
+//
+// For each agent the hook script is copied next to that agent's config, so each
+// edit runs a local file and needs no network access.
 
 import { spawnSync } from "node:child_process"
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
@@ -20,100 +21,193 @@ import { fileURLToPath } from "node:url"
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SCRIPT = join(HERE, "couplets.mjs")
 const MARKER = "onehook-noslop"
-const MATCHER = "Write|Edit|MultiEdit"
 
-function target(project) {
-  if (project) {
-    const dir = join(process.cwd(), ".claude")
-    return {
-      label: "project",
-      settings: join(dir, "settings.json"),
-      hookDir: join(dir, "hooks", MARKER),
-      command: `node "$CLAUDE_PROJECT_DIR/.claude/hooks/${MARKER}/couplets.mjs" --hook`,
-    }
-  }
-  const dir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude")
-  const defaultDir = !process.env.CLAUDE_CONFIG_DIR
-  return {
-    label: "global",
-    settings: join(dir, "settings.json"),
-    hookDir: join(dir, "hooks", MARKER),
-    command: defaultDir
-      ? `node "$HOME/.claude/hooks/${MARKER}/couplets.mjs" --hook`
-      : `node "${join(dir, "hooks", MARKER, "couplets.mjs")}" --hook`,
-  }
+const home = (envVar, name) => process.env[envVar] || join(homedir(), name)
+
+// kind "nested": { hooks: { <event>: [ { matcher, hooks: [ {type, command} ] } ] } }
+// kind "flat":   { version: 1, hooks: { <event>: [ {command} ] } }      (Cursor)
+// kind "file":   a whole JSON file that belongs to this hook               (Copilot)
+const AGENTS = {
+  claude: {
+    name: "Claude Code",
+    userDir: () => home("CLAUDE_CONFIG_DIR", ".claude"),
+    projectDir: ".claude",
+    configFile: "settings.json",
+    kind: "nested",
+    event: "PreToolUse",
+    matcher: "Write|Edit|MultiEdit",
+    projectCommand: `node "$CLAUDE_PROJECT_DIR/.claude/hooks/${MARKER}/couplets.mjs" --hook`,
+    reload: "Restart Claude Code or open /hooks.",
+  },
+  codex: {
+    name: "Codex",
+    userDir: () => home("CODEX_HOME", ".codex"),
+    projectDir: ".codex",
+    configFile: "hooks.json",
+    kind: "nested",
+    event: "PreToolUse",
+    matcher: "^(apply_patch|Edit|Write)$",
+    extra: { timeout: 10, statusMessage: "Checking prose for quantifier couplets" },
+    projectCommand: `node "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.codex/hooks/${MARKER}/couplets.mjs" --hook`,
+    reload: "Open /hooks in Codex and trust the new hook. Codex skips untrusted hooks.",
+  },
+  cursor: {
+    name: "Cursor",
+    userDir: () => join(homedir(), ".cursor"),
+    projectDir: ".cursor",
+    configFile: "hooks.json",
+    kind: "flat",
+    event: "preToolUse",
+    extra: { timeout: 10 },
+    projectCommand: `node .cursor/hooks/${MARKER}/couplets.mjs --hook`,
+    reload: "Restart Cursor.",
+  },
+  gemini: {
+    name: "Gemini CLI",
+    userDir: () => join(homedir(), ".gemini"),
+    projectDir: ".gemini",
+    configFile: "settings.json",
+    kind: "nested",
+    event: "BeforeTool",
+    matcher: "write_file|replace",
+    extra: { name: MARKER, timeout: 10000 },
+    projectCommand: `node "$GEMINI_PROJECT_DIR/.gemini/hooks/${MARKER}/couplets.mjs" --hook`,
+    reload: "Restart Gemini CLI.",
+  },
+  copilot: {
+    name: "GitHub Copilot CLI",
+    userDir: () => home("COPILOT_HOME", ".copilot"),
+    projectDir: ".github",
+    configFile: `hooks/${MARKER}.json`,
+    kind: "file",
+    event: "preToolUse",
+    projectCommand: `node .github/hooks/${MARKER}/couplets.mjs --hook`,
+    reload: "Restart Copilot CLI.",
+  },
 }
 
-function readSettings(path) {
+function locate(id, project) {
+  const a = AGENTS[id]
+  const base = project ? join(process.cwd(), a.projectDir) : a.userDir()
+  const hookDir = join(base, "hooks", MARKER)
+  const command = project ? a.projectCommand : `node "${join(hookDir, "couplets.mjs")}" --hook`
+  return { ...a, id, base, hookDir, command, config: join(base, a.configFile) }
+}
+
+function readJson(path) {
   if (!existsSync(path)) return {}
   const raw = readFileSync(path, "utf8")
   if (!raw.trim()) return {}
   try {
     return JSON.parse(raw)
   } catch (e) {
-    console.error(`Cannot parse ${path}: ${e.message}\nFix the file and run the command again.`)
-    process.exit(1)
+    throw new Error(`Cannot parse ${path}: ${e.message}. Fix the file and run the command again.`)
   }
 }
 
-function isOurs(h) {
-  return typeof h?.command === "string" && h.command.includes(MARKER)
+function writeJson(path, data) {
+  mkdirSync(dirname(path), { recursive: true })
+  if (existsSync(path)) copyFileSync(path, `${path}.bak-${MARKER}`)
+  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`)
 }
 
-function removeOurs(settings) {
-  const groups = settings.hooks?.PreToolUse
-  if (!Array.isArray(groups)) return false
+const ours = (h) => typeof h?.command === "string" && h.command.includes(MARKER)
+
+// Remove our entries from a config object. Returns true when something was removed.
+function strip(t, cfg) {
+  const list = cfg.hooks?.[t.event]
+  if (!Array.isArray(list)) return false
   let removed = false
-  const kept = []
-  for (const g of groups) {
-    const hooks = (g.hooks ?? []).filter((h) => {
-      if (isOurs(h)) removed = true
-      return !isOurs(h)
-    })
-    if (hooks.length) kept.push({ ...g, hooks })
+  let kept
+  if (t.kind === "flat") {
+    kept = list.filter((h) => !(ours(h) && (removed = true)))
+  } else {
+    kept = []
+    for (const g of list) {
+      const hooks = (g.hooks ?? []).filter((h) => !(ours(h) && (removed = true)))
+      if (hooks.length) kept.push({ ...g, hooks })
+    }
   }
-  if (kept.length) settings.hooks.PreToolUse = kept
-  else delete settings.hooks.PreToolUse
-  if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks
+  if (kept.length) cfg.hooks[t.event] = kept
+  else delete cfg.hooks[t.event]
+  if (!Object.keys(cfg.hooks).length) delete cfg.hooks
   return removed
 }
 
-function writeSettings(path, settings) {
-  mkdirSync(dirname(path), { recursive: true })
-  if (existsSync(path)) copyFileSync(path, `${path}.bak-${MARKER}`)
-  writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`)
+function planInstall(t) {
+  if (t.kind === "file") {
+    return {
+      version: 1,
+      hooks: { preToolUse: [{ type: "command", bash: t.command, command: t.command, timeoutSec: 10 }] },
+    }
+  }
+  const cfg = readJson(t.config)
+  strip(t, cfg)
+  cfg.hooks ??= {}
+  cfg.hooks[t.event] ??= []
+  const hook = { type: "command", command: t.command, ...t.extra }
+  if (t.kind === "flat") {
+    cfg.version ??= 1
+    const { type, ...flat } = hook
+    cfg.hooks[t.event].push(flat)
+  } else {
+    cfg.hooks[t.event].push({ matcher: t.matcher, hooks: [hook] })
+  }
+  return cfg
+}
+
+function selectAgents(args, project) {
+  const i = args.indexOf("--agent")
+  const raw = i >= 0 ? args[i + 1] : undefined
+  if (raw) {
+    const ids = raw === "all" ? Object.keys(AGENTS) : raw.split(",").map((s) => s.trim())
+    const bad = ids.filter((id) => !AGENTS[id])
+    if (bad.length) throw new Error(`Unknown agent: ${bad.join(", ")}. Use ${Object.keys(AGENTS).join(", ")} or all.`)
+    return ids
+  }
+  const found = Object.keys(AGENTS).filter((id) => existsSync(AGENTS[id].userDir()))
+  if (!found.length) {
+    throw new Error(`No agent config folder found. Name the agents with --agent ${Object.keys(AGENTS).join(",")}.`)
+  }
+  return found
 }
 
 function install(args) {
-  const t = target(args.includes("--project"))
+  const project = args.includes("--project")
   const dryRun = args.includes("--dry-run")
-  const settings = readSettings(t.settings)
-  removeOurs(settings)
-  settings.hooks ??= {}
-  settings.hooks.PreToolUse ??= []
-  settings.hooks.PreToolUse.push({ matcher: MATCHER, hooks: [{ type: "command", command: t.command }] })
-
-  if (dryRun) {
-    console.log(`Would copy couplets.mjs to ${t.hookDir}`)
-    console.log(`Would write ${t.settings}:\n${JSON.stringify(settings, null, 2)}`)
-    return
+  const targets = selectAgents(args, project).map((id) => locate(id, project))
+  const plans = targets.map((t) => [t, planInstall(t)]) // parse every config before writing any
+  for (const [t, cfg] of plans) {
+    if (dryRun) {
+      console.log(`\n${t.name}: would copy couplets.mjs to ${t.hookDir}`)
+      console.log(`${t.name}: would write ${t.config}:\n${JSON.stringify(cfg, null, 2)}`)
+      continue
+    }
+    mkdirSync(t.hookDir, { recursive: true })
+    copyFileSync(SCRIPT, join(t.hookDir, "couplets.mjs"))
+    writeJson(t.config, cfg)
+    console.log(`\n${t.name}: installed.`)
+    console.log(`  Script: ${join(t.hookDir, "couplets.mjs")}`)
+    console.log(`  Config: ${t.config}`)
+    console.log(`  ${t.reload}`)
   }
-  mkdirSync(t.hookDir, { recursive: true })
-  copyFileSync(SCRIPT, join(t.hookDir, "couplets.mjs"))
-  writeSettings(t.settings, settings)
-  console.log(`Installed the ${t.label} hook.`)
-  console.log(`  Script:   ${join(t.hookDir, "couplets.mjs")}`)
-  console.log(`  Settings: ${t.settings} (backup: ${t.settings}.bak-${MARKER})`)
-  console.log("Restart Claude Code or open /hooks to load it.")
 }
 
 function uninstall(args) {
-  const t = target(args.includes("--project"))
-  const settings = readSettings(t.settings)
-  const removed = removeOurs(settings)
-  if (removed) writeSettings(t.settings, settings)
-  if (existsSync(t.hookDir)) rmSync(t.hookDir, { recursive: true, force: true })
-  console.log(removed ? `Removed the ${t.label} hook from ${t.settings}.` : `No ${t.label} hook found in ${t.settings}.`)
+  const project = args.includes("--project")
+  for (const t of selectAgents(args, project).map((id) => locate(id, project))) {
+    let removed = false
+    if (t.kind === "file") {
+      removed = existsSync(t.config)
+      rmSync(t.config, { force: true })
+    } else {
+      const cfg = readJson(t.config)
+      removed = strip(t, cfg)
+      if (removed) writeJson(t.config, cfg)
+    }
+    if (existsSync(t.hookDir)) rmSync(t.hookDir, { recursive: true, force: true })
+    console.log(`${t.name}: ${removed ? `removed from ${t.config}` : "no hook found"}.`)
+  }
 }
 
 function passthrough(args) {
@@ -123,17 +217,25 @@ function passthrough(args) {
 
 function usage(code) {
   console.log(`usage:
-  onehook-noslop install [--project] [--dry-run]
-  onehook-noslop uninstall [--project]
+  onehook-noslop install   [--project] [--agent <list>] [--dry-run]
+  onehook-noslop uninstall [--project] [--agent <list>]
   onehook-noslop scan <file-or-dir> [...more]
-  onehook-noslop hook`)
+  onehook-noslop hook
+
+<list>: comma-separated ${Object.keys(AGENTS).join(", ")}, or all.
+Without --agent: every agent whose user config folder exists.`)
   process.exit(code)
 }
 
 const [cmd, ...rest] = process.argv.slice(2)
-if (cmd === "install") install(rest)
-else if (cmd === "uninstall") uninstall(rest)
-else if (cmd === "scan") passthrough(rest)
-else if (cmd === "hook" || cmd === "--hook") passthrough(["--hook"])
-else if (cmd === "help" || cmd === "--help" || cmd === "-h") usage(0)
-else usage(1)
+try {
+  if (cmd === "install") install(rest)
+  else if (cmd === "uninstall") uninstall(rest)
+  else if (cmd === "scan") passthrough(rest)
+  else if (cmd === "hook" || cmd === "--hook") passthrough(["--hook"])
+  else if (cmd === "help" || cmd === "--help" || cmd === "-h") usage(0)
+  else usage(1)
+} catch (e) {
+  console.error(e.message)
+  process.exit(1)
+}
