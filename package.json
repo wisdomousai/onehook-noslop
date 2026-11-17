@@ -1,0 +1,35 @@
+{
+  "name": "onehook-noslop",
+  "version": "0.1.0",
+  "description": "Claude Code hook that blocks mirrored number phrases such as \"Three signals. One job.\" in prose edits.",
+  "type": "module",
+  "bin": {
+    "onehook-noslop": "cli.mjs"
+  },
+  "exports": "./couplets.mjs",
+  "files": [
+    "cli.mjs",
+    "couplets.mjs"
+  ],
+  "scripts": {
+    "test": "node --test test.mjs install.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude-code",
+    "hook",
+    "prose",
+    "lint",
+    "writing"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wisdomousai/onehook-noslop.git"
+  },
+  "homepage": "https://github.com/wisdomousai/onehook-noslop#readme",
+  "bugs": "https://github.com/wisdomousai/onehook-noslop/issues",
+  "license": "MIT",
+  "author": "Wisdomous AI"
+}

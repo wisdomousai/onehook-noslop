@@ -21,39 +21,44 @@ The hook checks only files with these extensions: `.md`, `.mdx`, `.txt`, `.ts`, 
 
 ## Install for all projects
 
-1. Clone the repository:
+```sh
+npx onehook-noslop install
+```
 
-   ```sh
-   git clone https://github.com/wisdomousai/onehook-noslop ~/.claude/onehook-noslop
-   ```
+The installer does these steps:
 
-2. Add the hook to `~/.claude/settings.json`:
+1. It copies `couplets.mjs` to `~/.claude/hooks/onehook-noslop/`.
+2. It adds a `PreToolUse` entry for `Write|Edit|MultiEdit` to `~/.claude/settings.json`. It keeps all other settings and hooks.
+3. It saves the previous settings file as `settings.json.bak-onehook-noslop`.
 
-   ```json
-   {
-     "hooks": {
-       "PreToolUse": [
-         {
-           "matcher": "Write|Edit|MultiEdit",
-           "hooks": [
-             {
-               "type": "command",
-               "command": "node \"$HOME/.claude/onehook-noslop/couplets.mjs\" --hook"
-             }
-           ]
-         }
-       ]
-     }
-   }
-   ```
+Each edit runs the local copy of the script, so the hook does not need network access. If you run the installer again, it replaces its own entry and does not add a second one. If `CLAUDE_CONFIG_DIR` is set, the installer uses that directory instead of `~/.claude`.
 
-   If the file already has a `hooks` key, add the entry to the existing `PreToolUse` list.
+After the install, restart Claude Code or open `/hooks` to load the hook.
 
-3. Restart Claude Code, or open `/hooks` to reload the configuration.
+To see the changes before you apply them, add `--dry-run`.
 
 ## Install for one project
 
-Copy `couplets.mjs` into the project, for example to `tools/prose/couplets.mjs`. Then add the hook to the project's `.claude/settings.json`:
+Run this in the project root:
+
+```sh
+npx onehook-noslop install --project
+```
+
+The installer copies the script to `.claude/hooks/onehook-noslop/` and adds the hook to `.claude/settings.json`. Commit both so the hook applies to everyone who works on the project.
+
+## Uninstall
+
+```sh
+npx onehook-noslop uninstall            # global
+npx onehook-noslop uninstall --project  # current project
+```
+
+The command removes the hook entry and the copied script. Other hooks stay.
+
+## Install by hand
+
+Copy `couplets.mjs` to a location of your choice and add this to a Claude Code settings file:
 
 ```json
 {
@@ -64,7 +69,7 @@ Copy `couplets.mjs` into the project, for example to `tools/prose/couplets.mjs`.
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CLAUDE_PROJECT_DIR/tools/prose/couplets.mjs\" --hook"
+            "command": "node \"/path/to/couplets.mjs\" --hook"
           }
         ]
       }
@@ -75,18 +80,18 @@ Copy `couplets.mjs` into the project, for example to `tools/prose/couplets.mjs`.
 
 ## Skip files
 
-The hook skips paths that contain `node_modules/`, `.next/`, `dist/` or `.git/`, and the script itself. To skip more paths, set `NOSLOP_ALLOW` to a comma-separated list of path fragments. For example, a style guide that quotes couplets as bad examples:
+The hook skips paths that contain `node_modules/`, `.next/`, `dist/` or `.git/`, and the script itself. To skip more paths, set `NOSLOP_ALLOW` to a comma-separated list of path fragments. For example, a style guide that quotes couplets as bad examples. Put the variable in front of the hook command in the settings file:
 
 ```json
-"command": "NOSLOP_ALLOW=docs/style-guide.md,imports/ node \"$HOME/.claude/onehook-noslop/couplets.mjs\" --hook"
+"command": "NOSLOP_ALLOW=docs/style-guide.md,imports/ node \"$HOME/.claude/hooks/onehook-noslop/couplets.mjs\" --hook"
 ```
 
 ## Scan existing files
 
-Run the script with files or directories as arguments:
+Run the scan command with files or directories as arguments:
 
 ```sh
-node couplets.mjs docs src/content
+npx onehook-noslop scan docs src/content
 ```
 
 The script prints each hit with its line number. It exits with code 1 when it finds a hit, so you can use it in CI.
@@ -94,7 +99,7 @@ The script prints each hit with its line number. It exits with code 1 when it fi
 ## Run the tests
 
 ```sh
-node --test test.mjs
+npm test
 ```
 
 ## Limits
